@@ -11,34 +11,12 @@ env:
 jobs:
 
   # ─────────────────────────────────────────────
-  # JOB 1: Lint and test the application code
+  # JOB 1: Pull the real Docker image, run it,
+  #         send a real prediction, confirm it works
   # ─────────────────────────────────────────────
-  validate:
-    name: Validate Code
+  smoke-test:
+    name: Model Smoke Test
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install test dependencies
-        run: pip install pytest fastapi httpx pydantic
-
-      - name: Run tests
-        run: pytest tests/ -v
-
-  # ─────────────────────────────────────────────
-  # JOB 2: Read version from hf-space/Dockerfile and verify it exists on Docker Hub
-  # ─────────────────────────────────────────────
-  check-image:
-    name: Verify Docker Hub Image
-    runs-on: ubuntu-latest
-    outputs:
-      image_tag: ${{ steps.read-tag.outputs.tag }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -47,20 +25,60 @@ jobs:
         id: read-tag
         run: |
           TAG=$(grep '^FROM' hf-space/Dockerfile | awk -F: '{print $2}')
-          echo "Deploying image tag: $TAG"
+          echo "Image tag to test: $TAG"
           echo "tag=$TAG" >> $GITHUB_OUTPUT
 
-      - name: Check image exists on Docker Hub
-        run: docker manifest inspect ${{ env.DOCKER_REPO }}:${{ steps.read-tag.outputs.tag }}
+      - name: Pull image from Docker Hub
+        run: docker pull ${{ env.DOCKER_REPO }}:${{ steps.read-tag.outputs.tag }}
+
+      - name: Start container
+        run: |
+          docker run -d \
+            --name smoke-test \
+            -p 7860:7860 \
+            ${{ env.DOCKER_REPO }}:${{ steps.read-tag.outputs.tag }}
+
+      - name: Wait for model to load
+        run: |
+          echo "Waiting for container to be ready..."
+          for i in {1..20}; do
+            if curl -sf http://localhost:7860/health; then
+              echo ""
+              echo "Container is ready!"
+              break
+            fi
+            echo "Attempt $i/20 — retrying in 15 seconds..."
+            sleep 15
+          done
+
+      - name: Run smoke test on predict endpoint
+        run: |
+          RESPONSE=$(curl -sf -X POST http://localhost:7860/predict \
+            -H "Content-Type: application/json" \
+            -d '{"text": "I love this MLOps course!"}')
+          echo "Model response: $RESPONSE"
+          python3 -c "
+          import sys, json
+          data = json.loads('$RESPONSE')
+          assert 'label' in data, 'Missing label field'
+          assert 'score' in data, 'Missing score field'
+          assert data['label'] in ['POSITIVE', 'NEGATIVE'], 'Invalid label value'
+          assert 0 <= float(data['score']) <= 1, 'Score out of range'
+          print('Smoke test passed — model is responding correctly')
+          "
+
+      - name: Stop container
+        if: always()
+        run: docker stop smoke-test && docker rm smoke-test
 
   # ─────────────────────────────────────────────
-  # JOB 3: Deploy to Hugging Face Spaces
-  # Runs only after validate and check-image pass
+  # JOB 2: Deploy to Hugging Face Spaces
+  #         Runs only after smoke-test passes
   # ─────────────────────────────────────────────
   deploy:
     name: Deploy to Hugging Face Spaces
     runs-on: ubuntu-latest
-    needs: [validate, check-image]
+    needs: smoke-test
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -85,7 +103,7 @@ jobs:
           "
 
   # ─────────────────────────────────────────────
-  # JOB 4: Confirm the deployment is live
+  # JOB 3: Confirm the deployment is live
   # ─────────────────────────────────────────────
   health-check:
     name: Post-Deploy Health Check

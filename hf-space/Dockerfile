@@ -1,3 +1,4 @@
-FROM 03sarath/distilbert-sentiment:v1 #Image version
+# Image version
+FROM 03sarath/distilbert-sentiment:v1
 
 EXPOSE 7860
